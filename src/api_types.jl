@@ -151,6 +151,13 @@ const H5D_CHUNK_CACHE_NSLOTS_DEFAULT = -1 % Csize_t
 const H5D_CHUNK_CACHE_NBYTES_DEFAULT = -1 % Csize_t
 const H5D_CHUNK_CACHE_W0_DEFAULT = Cdouble(-1)
 
+# space status
+const H5D_SPACE_STATUS_ERROR = Cint(-1)
+const H5D_SPACE_STATUS_NOT_ALLOCATED = Cint(0)
+const H5D_SPACE_STATUS_PART_ALLOCATED = Cint(1)
+const H5D_SPACE_STATUS_ALLOCATED = Cint(2)
+const H5D_space_status_t = Cint
+
 # error-related constants
 const H5E_DEFAULT      = 0
 
@@ -336,6 +343,7 @@ const H5T_NATIVE_DOUBLE   = _read_const(:H5T_NATIVE_DOUBLE_g)
 const H5T_VARIABLE = reinterpret(UInt, -1)
 
 # Filter constants
+const H5Z_FLAG_MANDATORY = 0x0000
 const H5Z_FLAG_OPTIONAL = 0x0001
 const H5Z_FLAG_REVERSE = 0x0100
 const H5Z_CLASS_T_VERS = 1

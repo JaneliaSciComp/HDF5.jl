@@ -281,9 +281,9 @@ end
 Base.cconvert(::Type{hid_t}, attr::Attribute) = attr.id
 
 struct Attributes
-    parent::Union{File,Group,Dataset}
+    parent::Union{File,Object}
 end
-attributes(p::Union{File,Group,Dataset}) = Attributes(p)
+attributes(p::Union{File,Object}) = Attributes(p)
 
 # Methods for reference types
 function Reference(parent::Union{File,Group,Dataset}, name::AbstractString)
@@ -840,6 +840,7 @@ function _prop_set!(p::Properties, name::Symbol, val, check::Bool = true)
                name === :compress    ? h5p_set_deflate(p, val...) :
                name === :deflate     ? h5p_set_deflate(p, val...) :
                name === :external    ? h5p_set_external(p, val...) :
+               name === :filter      ? set_filter(p, val...) :
                name === :layout      ? h5p_set_layout(p, val...) :
                name === :shuffle     ? h5p_set_shuffle(p, val...) :
                name === :track_times ? h5p_set_obj_track_times(p, val...) : # H5P_OBJECT_CREATE
@@ -1182,10 +1183,10 @@ function Base.read(obj::DatasetOrAttribute)
     return val
 end
 
-function Base.getindex(dset::Dataset, I...)
-    dtype = datatype(dset)
+function Base.getindex(obj::DatasetOrAttribute, I...)
+    dtype = datatype(obj)
     T = get_jl_type(dtype)
-    val = generic_read(dset, dtype, T, I...)
+    val = generic_read(obj, dtype, T, I...)
     close(dtype)
     return val
 end
@@ -1712,19 +1713,117 @@ function create_external_dataset(parent::Union{File,Group}, name::AbstractString
     create_dataset(parent, name, datatype(t), dataspace(sz); dcpl=dcpl)
 end
 
+"""
+    do_write_chunk(dataset::Dataset, offset, chunk_bytes::Vector{UInt8}, filter_mask=0)
+
+Write a raw chunk at a given offset.
+`offset` is a 1-based list of rank `ndims(dataset)` and must fall on a chunk boundary.
+"""
 function do_write_chunk(dataset::Dataset, offset, chunk_bytes::Vector{UInt8}, filter_mask=0)
     checkvalid(dataset)
     offs = collect(hsize_t, reverse(offset)) .- 1
-    h5do_write_chunk(dataset, H5P_DEFAULT, UInt32(filter_mask), offs, length(chunk_bytes), chunk_bytes)
+    h5d_write_chunk(dataset, H5P_DEFAULT, UInt32(filter_mask), offs, length(chunk_bytes), chunk_bytes)
 end
 
-struct ChunkStorage
+"""
+    do_write_chunk(dataset::Dataset, index, chunk_bytes::Vector{UInt8}, filter_mask=0)
+
+Write a raw chunk at a given linear index.
+`index` is 1-based and consecutive up to the number of chunks.
+"""
+function do_write_chunk(dataset::Dataset, index::Integer, chunk_bytes::Vector{UInt8}, filter_mask=0)
+    checkvalid(dataset)
+    index -= 1
+    h5d_write_chunk(dataset, H5P_DEFAULT, UInt32(filter_mask), index, chunk_bytes)
+end
+
+"""
+    do_read_chunk(dataset::Dataset, offset)
+
+Read a raw chunk at a given offset.
+`offset` is a 1-based list of rank `ndims(dataset)` and must fall on a chunk boundary.
+"""
+function do_read_chunk(dataset::Dataset, offset)
+    checkvalid(dataset)
+    offs = collect(hsize_t, reverse(offset)) .- 1
+    filters = Ref{UInt32}()
+    buf = h5d_read_chunk(dataset, offs; filters = filters)
+    return (filters[], buf)
+end
+
+"""
+    do_read_chunk(dataset::Dataset, index::Integer)
+
+Read a raw chunk at a given index.
+`index` is 1-based and consecutive up to the number of chunks.
+"""
+function do_read_chunk(dataset::Dataset, index::Integer)
+    checkvalid(dataset)
+    index -= 1
+    filters = Ref{UInt32}()
+    buf = h5d_read_chunk(dataset, index; filters = filters)
+    return (filters[], buf)
+end
+
+struct ChunkStorage{I<:IndexStyle,N} <: AbstractArray{Tuple{UInt32,Vector{UInt8}},N}
     dataset::Dataset
 end
+ChunkStorage{I,N}(dataset) where {I,N} = ChunkStorage{I,N}(dataset)
+Base.IndexStyle(::ChunkStorage{I}) where {I<:IndexStyle} = I()
 
-function Base.setindex!(chunk_storage::ChunkStorage, v::Tuple{<:Integer,Vector{UInt8}}, index::Integer...)
-    do_write_chunk(chunk_storage.dataset, hsize_t.(index), v[2], UInt32(v[1]))
+# ChunkStorage{IndexCartesian,N} (default)
+
+function ChunkStorage(dataset)
+    ChunkStorage{IndexCartesian, ndims(dataset)}(dataset)
 end
+
+Base.size(cs::ChunkStorage{IndexCartesian}) = get_num_chunks_per_dim(cs.dataset)
+ 
+
+function Base.axes(cs::ChunkStorage{IndexCartesian})
+    chunk = get_chunk(cs.dataset)
+    extent = size(cs.dataset)
+    ntuple(i -> 1:chunk[i]:extent[i], length(extent))
+end
+
+function Base.setindex!(chunk_storage::ChunkStorage{IndexCartesian}, v::Tuple{<:Integer,Vector{UInt8}}, index::Integer...)
+    do_write_chunk(chunk_storage.dataset, index, v[2], v[1])
+end
+
+function Base.getindex(chunk_storage::ChunkStorage{IndexCartesian}, index::Integer...)
+    do_read_chunk(chunk_storage.dataset, hsize_t.(index))
+end
+
+# ChunkStorage{IndexLinear,1}
+
+ChunkStorage{IndexLinear}(dataset) = ChunkStorage{IndexLinear,1}(dataset)
+Base.size(cs::ChunkStorage{IndexLinear})   = (get_num_chunks(cs.dataset),)
+Base.length(cs::ChunkStorage{IndexLinear}) =  get_num_chunks(cs.dataset)
+
+function Base.setindex!(chunk_storage::ChunkStorage{IndexLinear}, v::Tuple{<:Integer,Vector{UInt8}}, index::Integer)
+    do_write_chunk(chunk_storage.dataset, index, v[2], v[1])
+end
+
+function Base.getindex(chunk_storage::ChunkStorage{IndexLinear}, index::Integer)
+    do_read_chunk(chunk_storage.dataset, index)
+end
+
+# TODO: Move to show.jl. May need to include show.jl after this line.
+@static if VERSION < v"1.7"
+# ChunkStorage axes may be StepRanges, but this is not available until v"1.6.0"
+# no method matching CartesianIndices(::Tuple{StepRange{Int64,Int64},UnitRange{Int64}}) until v"1.6.0"
+
+function Base.show(io::IO, cs::ChunkStorage{IndexCartesian,N}) where N
+    println(io, "HDF5.ChunkStorage{IndexCartesian,$N}")
+    print(io, "Axes: ")
+    println(io, axes(cs))
+    print(io, cs.dataset)
+end
+Base.show(io::IO, ::MIME{Symbol("text/plain")}, cs::ChunkStorage{IndexCartesian,N}) where {N} = show(io, cs)
+
+end
+
+
 
 # end of high-level interface
 
@@ -1911,8 +2010,11 @@ get_create_properties(g::Group)     = Properties(h5g_get_create_plist(g), H5P_GR
 get_create_properties(f::File)      = Properties(h5f_get_create_plist(f), H5P_FILE_CREATE)
 get_create_properties(a::Attribute) = Properties(h5a_get_create_plist(a), H5P_ATTRIBUTE_CREATE)
 
-get_chunk(p::Properties) = tuple(convert(Vector{Int}, reverse(h5p_get_chunk(p)))...)
-set_chunk(p::Properties, dims...) = h5p_set_chunk(p, length(dims), hsize_t[reverse(dims)...])
+function get_chunk(p::Properties)
+    dims, N = h5p_get_chunk(p)
+    ntuple(i -> Int(dims[N-i+1]), N)
+end
+
 function get_chunk(dset::Dataset)
     p = get_create_properties(dset)
     local ret
@@ -1922,6 +2024,23 @@ function get_chunk(dset::Dataset)
         close(p)
     end
     ret
+end
+
+set_chunk(p::Properties, dims...) = h5p_set_chunk(p, length(dims), hsize_t[reverse(dims)...])
+
+# Set a single filter
+function set_filter(p::Properties, filter_id, flags, cd_values...)
+    # Passing cd_values as Cuint[] allocates less than passing as
+    # Ref{NTuple{N,Cuint}} (and it is compatible with Julia 1.3)
+    h5p_set_filter(p::Properties, filter_id, flags, length(cd_values), Cuint[cd_values...])
+end
+
+# Set multiple filters
+function set_filter(p::Properties, filter::Tuple, additional_filters...)
+    set_filter(p::Properties, filter...)
+    for f in additional_filters
+      set_filter(p::Properties, f...)
+    end
 end
 
 get_alignment(p::Properties)     = h5p_get_alignment(checkvalid(p))
