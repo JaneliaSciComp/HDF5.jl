@@ -193,9 +193,10 @@ function h5readattr(filename, name::AbstractString)
 end
 
 
-struct AttributeDict <: AbstractDict{String,Any}
+struct AttributeDict{T} <: AbstractDict{String,T}
     parent::Object
 end
+AttributeDict(parent::Object) = AttributeDict{Any}(parent)
 
 """
     attrs(object::Union{File,Group,Dataset,Datatype})
@@ -210,23 +211,23 @@ delete!(attrs(object), "name") # delete an attribute
 keys(attrs(object))            # list the attribute names
 ```
 """
-function attrs(parent::Object)
-    return AttributeDict(parent)
+function attrs(parent::Object, ::Type{T} = Any) where T
+    return AttributeDict{T}(parent)
 end
-attrs(file::File) = attrs(open_group(file, "."))
+attrs(file::File, ::Type{T} = Any) where T = attrs(open_group(file, "."), T)
 
 Base.haskey(attrdict::AttributeDict, path::AbstractString) = API.h5a_exists(checkvalid(attrdict.parent), path)
 Base.length(attrdict::AttributeDict) = Int(object_info(attrdict.parent).num_attrs)
 
-function Base.getindex(x::AttributeDict, name::AbstractString)
+function Base.getindex(x::AttributeDict{T}, name::AbstractString)::T where T
     haskey(x, name) || throw(KeyError(name))
     read_attribute(x.parent, name)
 end
-function Base.get(x::AttributeDict, name::AbstractString, default)
+function Base.get(x::AttributeDict{T}, name::AbstractString, default)::T where T
     haskey(x, name) || return default
     read_attribute(x.parent, name)
 end
-function Base.setindex!(attrdict::AttributeDict, val, name::AbstractString)
+function Base.setindex!(attrdict::AttributeDict{T}, val::T, name::AbstractString) where T
     if haskey(attrdict, name)
         # in case of an error, we write first to a temporary, then rename
         _name = tempname()
@@ -265,7 +266,11 @@ function Base.iterate(attrdict::AttributeDict, (keyvec, n))
         return iter
     end
     key, nn = iter
-    return (key => attrdict[key]), (keyvec, nn)
+    try
+        return (key => attrdict[key]), (keyvec, nn)
+    catch err
+        return iterate(attrdict, (keyvec, nn))
+    end
 end
 
 
